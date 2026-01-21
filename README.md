@@ -29,7 +29,6 @@ fusion/
 └── whu/
 ```
 
-You can obtain the trained model parameters through this [link](https://pan.baidu.com/s/1H1RmrcXCUCYg169nq-KftQ) with password:ndbp.
 
 ## Training
 To train the models for each dataset, use the following commands:
@@ -69,3 +68,5 @@ For WHU dataset:
 ```bash
 python whu_test.py
 ```
+
+You can obtain the trained model parameters through this [link](https://pan.baidu.com/s/1H1RmrcXCUCYg169nq-KftQ) with password:ndbp.
