@@ -1,3 +1,18 @@
+"""
+WHU数据集 Step1 训练脚本 - 跨域迁移预训练
+
+与fmb_train_step1.py结构相同，使用WHU卫星遥感数据集。
+目标: 训练编码器和跨域迁移模块。
+
+训练流程同FMB/POS Step1:
+1. 对抗训练: 训练域判别器区分VI/IR特征
+2. 生成训练: 编码器+迁移+解码器双向跨域重建
+
+损失: L1重建 + SSIM重建 + 域对抗 + 均值方差对齐
+数据集路径: datasets/whu/train/{vi, ir}
+模型保存: save/whu/
+"""
+
 import torch
 import torch.optim as optim
 import kornia.losses as losses
@@ -14,6 +29,7 @@ from util.MeanVarianceLoss import LocalMeanVarianceLoss
 import warnings
 warnings.filterwarnings("ignore")
 
+# ==================== 超参数与路径配置 ====================
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 batch_size = 4
@@ -32,18 +48,20 @@ decoder_1_path = "save/whu/decoder_1.pth"
 decoder_2_path = "save/whu/decoder_2.pth"
 
 def save_model(model, path):
+    """保存模型权重到指定路径"""
     torch.save(model.state_dict(), path)
     print(f"Model saved to {path}")
 
 train_loader = get_train_loader(dir_vi_train, dir_ir_train, batch_size)
 
-encoder_1 = EncoderVi()
-encoder_2 = EncoderIr()
-transfer_vi_to_ir = transfer()
-transfer_ir_to_vi = transfer()
-domain_discriminator = DomDiscriminator()
-decoder_1 = head_1()
-decoder_2 = head_2()
+# ==================== 模型初始化 ====================
+encoder_1 = EncoderVi()            # 可见光编码器
+encoder_2 = EncoderIr()            # 红外编码器
+transfer_vi_to_ir = transfer()     # VI→IR 跨域迁移
+transfer_ir_to_vi = transfer()     # IR→VI 跨域迁移
+domain_discriminator = DomDiscriminator()  # 域判别器
+decoder_1 = head_1()               # VI重建解码器
+decoder_2 = head_2()               # IR重建解码器
 
 encoder_1.to(device)
 encoder_2.to(device)
@@ -70,6 +88,7 @@ domain_discriminator.train()
 decoder_1.train()
 decoder_2.train()
 
+# ==================== 损失函数与训练循环 ====================
 ssim_loss = losses.SSIMLoss(window_size=11, reduction='mean')
 bce_loss = nn.BCELoss()
 loss_calculator = LocalMeanVarianceLoss(window_size=4)
@@ -80,6 +99,7 @@ for epoch in range(epochs):
     for batch_idx, (vi_images, ir_images) in enumerate(train_loader):
         vi_images, ir_images = vi_images.to(device), ir_images.to(device)
 
+        # ---- 阶段1: 训练域判别器 ----
         encoder_1.eval()
         encoder_2.eval()
         with torch.no_grad():
@@ -103,6 +123,7 @@ for epoch in range(epochs):
         domain_loss_real.backward()
         optimizer_domain_discriminator.step()
 
+        # ---- 阶段2: 训练编码器+迁移+解码器 ----
         encoder_1.train()
         encoder_2.train()
         domain_discriminator.eval()
@@ -119,27 +140,30 @@ for epoch in range(epochs):
         vi_features = encoder_1(vi_images)
         ir_features = encoder_2(ir_images)
 
+        # 跨域迁移
         vi_allin = transfer_vi_to_ir(vi_features, ir_features)
         ir_allin = transfer_ir_to_vi(ir_features, vi_features)
 
+        # 双向重建
         ir_out = decoder_2(vi_allin)
         vi_out = decoder_1(ir_allin)
 
+        # 重建损失
         reir_loss = F.l1_loss(ir_out, ir_images) + ssim_loss(ir_out, ir_images)
         revi_loss = F.l1_loss(vi_out, vi_images) + ssim_loss(vi_out, vi_images)
         recon_loss = revi_loss + reir_loss
 
-
+        # 域对抗损失
         domain_vi_a_pred = domain_discriminator(vi_allin)
         domain_ir_a_pred = domain_discriminator(ir_allin)
-
         domain_loss_fake = bce_loss(domain_vi_a_pred, domain_un_labels) + bce_loss(domain_ir_a_pred, domain_un_labels)
         domain_loss = domain_loss_fake
 
-
+        # 均值-方差对齐损失
         mean_loss, variance_loss = loss_calculator(ir_allin, vi_allin)
         m_v_loss = mean_loss + variance_loss
 
+        # 总损失
         total_loss = recon_loss + lambda_domain * domain_loss + lambda_mean_vari * m_v_loss
         total_loss.backward()
 
@@ -154,6 +178,7 @@ for epoch in range(epochs):
             print(f"Epoch [{epoch + 1}/{epochs}], Step [{batch_idx}/{len(train_loader)}], total_loss: {total_loss.item():.4f}")
 
 
+# ==================== 保存所有模型 ====================
 save_model(encoder_1, encoder_1_path)
 save_model(encoder_2, encoder_2_path)
 save_model(transfer_vi_to_ir, transfer_vi_to_ir_path)
