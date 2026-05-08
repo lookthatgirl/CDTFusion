@@ -1,3 +1,17 @@
+"""
+POS(Potsdam)数据集 Step2 训练脚本 - 联合融合与分割训练
+
+与fmb_train_step2.py结构相同，使用Potsdam数据集（6类分割）。
+目标: 冻结Step1预训练模块，联合训练融合和分割分支。
+
+差异:
+- 使用head_seg_pos分割解码器（输出6类，带跳跃连接）
+- dice_loss指定num_classes=6
+
+数据集路径: datasets/pos/train/{vi, ir, lbl}
+模型保存: save/pos/
+"""
+
 import torch
 import torch.optim as optim
 from util.seg_dataloader_pos import get_train_loader
@@ -17,6 +31,7 @@ warnings.filterwarnings("ignore")
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
 
+# ==================== 路径配置 ====================
 dir_vi_train = "datasets/pos/train/vi"
 dir_ir_train = "datasets/pos/train/ir"
 dir_seg_train = "datasets/pos/train/lbl"
@@ -27,22 +42,27 @@ mixer_path = "save/pos/mixer.pth"
 mixer_f_path = "save/pos/mixer_f.pth"
 task_interaction_path = "save/pos/task_interaction.pth"
 
+
 def save_model(model, path):
+    """保存模型权重到指定路径"""
     torch.save(model.state_dict(), path)
     print(f"Model saved to {path}")
 
-encoder_1 = EncoderVi()
-encoder_2 = EncoderIr()
-transfer_vi_to_ir = transfer()
-transfer_ir_to_vi = transfer()
-decoder_3 = head_seg_pos()
-decoder_4 = head_fus()
+
+# ==================== 模型初始化 ====================
+encoder_1 = EncoderVi()            # 可见光编码器（冻结）
+encoder_2 = EncoderIr()            # 红外编码器（冻结）
+transfer_vi_to_ir = transfer()     # VI→IR迁移（冻结）
+transfer_ir_to_vi = transfer()     # IR→VI迁移（冻结）
+decoder_3 = head_seg_pos()         # POS分割解码器（6类，带跳跃连接）
+decoder_4 = head_fus()             # 融合解码器
 hidden_dim_channel = 1024
 hidden_dim_token = 512
-mixer = Mixer(512, 512, hidden_dim_channel, hidden_dim_token)
-mixer_f = Mixer(512, 512, hidden_dim_channel, hidden_dim_token)
-taskinteraction = TaskInteraction(in_channels=512)
+mixer = Mixer(512, 512, hidden_dim_channel, hidden_dim_token)      # 分割特征混合器
+mixer_f = Mixer(512, 512, hidden_dim_channel, hidden_dim_token)    # 融合特征混合器
+taskinteraction = TaskInteraction(in_channels=512)                 # 任务交互模块
 
+# 加载Step1预训练权重
 encoder_1.load_state_dict(torch.load('save/pos/encoder_1.pth'))
 encoder_2.load_state_dict(torch.load('save/pos/encoder_2.pth'))
 transfer_vi_to_ir.load_state_dict(torch.load('save/pos/transfer_vi_to_ir.pth'))
@@ -59,6 +79,7 @@ mixer_f.to(device)
 taskinteraction.to(device)
 
 
+# ==================== 超参数与优化器 ====================
 batch_size = 4
 epochs = 30
 lr=0.0001
@@ -76,37 +97,42 @@ mixer.train()
 mixer_f.train()
 taskinteraction.train()
 
+# ==================== 损失函数 ====================
 loss = nn.BCEWithLogitsLoss()
 criterion = nn.CrossEntropyLoss()
-
 fusionloss = Fusionloss_ir()
 
+# ==================== 训练循环 ====================
 for epoch in range(epochs):
     for batch_idx, (vi_images, ir_images, seg_images) in enumerate(train_loader):
         vi_images, ir_images, seg_images = vi_images.to(device), ir_images.to(device), seg_images.to(device)
+        # 提取Y通道作为融合目标
         rgb_images_ycrcb = RGB2YCrCb_Cuda1(vi_images)
-        opt_images = rgb_images_ycrcb[:, 0:1, :, :]
+        opt_images = rgb_images_ycrcb[:, 0:1, :, :]  # Y通道
 
         optimizer_decoder_3.zero_grad()
         optimizer_decoder_4.zero_grad()
         optimizer_mixer.zero_grad()
         optimizer_mixer_f.zero_grad()
         optimizer_taskinteraction.zero_grad()
+
+        # 冻结模块提取迁移特征
         with torch.no_grad():
             vi_features = encoder_1(vi_images)
             ir_features = encoder_2(ir_images)
             vi_allin = transfer_vi_to_ir(vi_features, ir_features)
             ir_allin = transfer_ir_to_vi(ir_features, vi_features)
 
+        # ---- 分割分支 ----
         seg_features = mixer(vi_allin, ir_allin)
-        seg_out = decoder_3(seg_features)
+        seg_out = decoder_3(seg_features)  # [B, 6, H, W]
 
         seg_loss = dice_loss(seg_out, seg_images, num_classes=6) + 0.5 * criterion(seg_out, seg_images)
 
-
+        # ---- 融合分支 ----
         fus_features = mixer_f(vi_allin, ir_allin)
         fus_features_taski = taskinteraction(fus_features, seg_features)
-        fus_out = decoder_4(fus_features_taski)
+        fus_out = decoder_4(fus_features_taski)  # [B, 1, H, W]
 
         fus_loss = fusionloss(opt_images, ir_images, fus_out)
 
@@ -122,6 +148,7 @@ for epoch in range(epochs):
         if batch_idx % 100 == 0:
             print(f"Epoch [{epoch + 1}/{epochs}], Step [{batch_idx}/{len(train_loader)}], total_loss: {total_loss.item():.4f}")
 
+# ==================== 保存Step2训练的模型 ====================
 save_model(decoder_3, decoder_3_path)
 save_model(decoder_4, decoder_4_path)
 save_model(mixer, mixer_path)
